@@ -63,6 +63,7 @@ struct FuncDef {
     aliases: Vec<String>,
     args: Vec<String>,
     body: Expr,
+    conv_req: Option<ConversionTarget>, // Preserves 'to ...' formatting
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +101,20 @@ enum Value {
     Number(BigRational),
     Duration(BigRational),
     Function(FuncDef, Vec<Value>),
+    Formatted(Box<Value>, ConversionTarget), // Bubbles formatting requests to the top level
+}
+
+impl Value {
+    fn unwrap(self) -> (Value, Option<ConversionTarget>) {
+        match self {
+            Value::Formatted(inner, req) => {
+                let (v, inner_req) = inner.unwrap();
+                // Outermost request takes precedence
+                (v, Some(req).or(inner_req))
+            }
+            _ => (self, None)
+        }
+    }
 }
 
 impl Expr {
@@ -132,13 +147,19 @@ enum Token {
     Plus, Minus, Multiply, Divide, Modulo, Underscore, LParen, RParen, To, Now,
     Assign,
     Duration(BigRational),
-    Space, // Required for intelligent semantic associativity
+    Space, 
 }
 
 #[derive(Default, Debug, Clone)]
 struct ConversionTarget {
     dp: Option<i32>,
     units: Option<Vec<FormatUnit>>,
+}
+
+impl ConversionTarget {
+    fn is_empty(&self) -> bool {
+        self.dp.is_none() && self.units.is_none()
+    }
 }
 
 fn parse_decimal(s: &str) -> Result<BigRational, String> {
@@ -258,10 +279,15 @@ fn build_registry() -> (Vec<UnitDef>, Vec<FuncDef>) {
                 }
                 if let Some(functions) = config.functions {
                     for (_, conf) in functions {
-                        if let Ok(tokens) = tokenize(&conf.definition) {
-                            if let Ok((ast, rest)) = parse_expr(&tokens) {
-                                if rest.is_empty() {
-                                    funcs.push(FuncDef { name: conf.name, aliases: conf.aliases, args: conf.arguments, body: ast });
+                        if let Ok(mut tokens) = tokenize(&conf.definition) {
+                            if let Ok(conv_req) = extract_keywords(&mut tokens, &registry) {
+                                let (mut rhs_tokens, _) = form_durations(tokens, &registry).unwrap_or((vec![], vec![]));
+                                rhs_tokens = combine_contiguous_durations(rhs_tokens);
+                                if let Ok((ast, rest)) = parse_expr(&rhs_tokens) {
+                                    if rest.is_empty() {
+                                        let req = if conv_req.is_empty() { None } else { Some(conv_req) };
+                                        funcs.push(FuncDef { name: conf.name, aliases: conf.aliases, args: conf.arguments, body: ast, conv_req: req });
+                                    }
                                 }
                             }
                         }
@@ -327,7 +353,6 @@ fn form_durations(tokens: Vec<Token>, registry: &[UnitDef]) -> Result<(Vec<Token
     let mut explicit_units = Vec::new();
     let mut i = 0;
 
-    // Intelligently binds Num and Ident even if separated by Space
     while i < tokens.len() {
         if let Token::Num(ref val) = tokens[i] {
             let mut j = i + 1;
@@ -354,7 +379,6 @@ fn combine_contiguous_durations(tokens: Vec<Token>) -> Vec<Token> {
     let mut new_tokens: Vec<Token> = Vec::new();
     for tok in tokens {
         if let Token::Duration(val) = tok {
-            // Space acts as a barrier protecting durations from combination
             if let Some(Token::Duration(last_val)) = new_tokens.last_mut() {
                 *last_val = last_val.clone() + val; 
             } else {
@@ -403,7 +427,6 @@ fn parse_mul_expr(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     Ok((lhs, rest))
 }
 
-// Left-associative function application delimited by spaces 
 fn parse_space_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     let (mut lhs, mut rest) = parse_nospace_app(tokens)?;
     while !rest.is_empty() {
@@ -416,7 +439,6 @@ fn parse_space_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     Ok((lhs, rest))
 }
 
-// Tighter binding application with no spaces (e.g. 5h30m or f(x))
 fn parse_nospace_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     let (mut lhs, mut rest) = parse_primary(tokens)?;
     while !rest.is_empty() {
@@ -457,11 +479,15 @@ fn parse_primary(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
 // --- 4. Evaluator (Resolves functions, args & math) ---
 
 fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>) -> Result<Value, String> {
-    match (l, r) {
-        (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
-        (Value::Number(a), Value::Duration(b)) => Ok(Value::Duration(a * b)),
-        (Value::Duration(a), Value::Number(b)) => Ok(Value::Duration(a * b)),
-        (Value::Duration(a), Value::Duration(b)) => Ok(Value::Duration(a + b)), 
+    let (l_val, l_req) = l.unwrap();
+    let (r_val, r_req) = r.unwrap();
+    let req = l_req.or(r_req);
+
+    let mut res = match (l_val, r_val) {
+        (Value::Number(a), Value::Number(b)) => Value::Number(a * b),
+        (Value::Number(a), Value::Duration(b)) => Value::Duration(a * b),
+        (Value::Duration(a), Value::Number(b)) => Value::Duration(a * b),
+        (Value::Duration(a), Value::Duration(b)) => Value::Duration(a + b), 
         (Value::Function(f, mut args), v) => {
             args.push(v);
             if args.len() == f.args.len() {
@@ -469,13 +495,20 @@ fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[Un
                 for (name, val) in f.args.iter().zip(args.into_iter()) {
                     new_env.insert(name.clone(), val);
                 }
-                eval(&f.body, &new_env, registry, funcs, last_val, inference_factor)
+                let mut val = eval(&f.body, &new_env, registry, funcs, last_val, inference_factor)?;
+                if let Some(f_req) = &f.conv_req {
+                    val = Value::Formatted(Box::new(val), f_req.clone());
+                }
+                val
             } else {
-                Ok(Value::Function(f, args))
+                Value::Function(f, args)
             }
         }
-        _ => Err("Invalid function application or juxtaposition".into()),
-    }
+        _ => return Err("Invalid function application or juxtaposition".into()),
+    };
+    
+    if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
+    Ok(res)
 }
 
 fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>) -> Result<Value, String> {
@@ -492,7 +525,13 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             }
             for def in funcs {
                 if def.name.to_lowercase() == name_lower || def.aliases.iter().any(|a| a.to_lowercase() == name_lower) {
-                    if def.args.is_empty() { return eval(&def.body, env, registry, funcs, last_val, inference_factor); }
+                    if def.args.is_empty() { 
+                        let mut val = eval(&def.body, env, registry, funcs, last_val, inference_factor)?; 
+                        if let Some(req) = &def.conv_req {
+                            val = Value::Formatted(Box::new(val), req.clone());
+                        }
+                        return Ok(val);
+                    }
                     return Ok(Value::Function(def.clone(), vec![]));
                 }
             }
@@ -501,77 +540,115 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
         Expr::Now => Ok(Value::Duration(BigRational::from_integer(BigInt::from(chrono::Local::now().num_seconds_from_midnight())))),
         Expr::Underscore => last_val.cloned().ok_or("No previous value to reference".into()),
         Expr::UnaryMinus(e) => {
-            match eval(e, env, registry, funcs, last_val, inference_factor)? {
-                Value::Number(n) => Ok(Value::Number(-n)),
-                Value::Duration(d) => Ok(Value::Duration(-d)),
-                Value::Function(..) => Err("Cannot negate a function".into()),
-            }
+            let (v_val, req) = eval(e, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let mut res = match v_val {
+                Value::Number(n) => Value::Number(-n),
+                Value::Duration(d) => Value::Duration(-d),
+                Value::Function(..) => return Err("Cannot negate a function".into()),
+                Value::Formatted(..) => unreachable!(), // Stripped by unwrap()
+            };
+            if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
+            Ok(res)
         }
         Expr::Add(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
-                (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
-                (Value::Duration(a), Value::Duration(b)) => Ok(Value::Duration(a + b)),
+            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let req = l_req.or(r_req);
+
+            let mut res = match (l_val, r_val) {
+                (Value::Number(a), Value::Number(b)) => Value::Number(a + b),
+                (Value::Duration(a), Value::Duration(b)) => Value::Duration(a + b),
                 (Value::Duration(a), Value::Number(b)) => {
-                    if let Some(f) = inference_factor { Ok(Value::Duration(a + b * f)) } else { Err("Ambiguous unitless number (cannot infer unit)".into()) }
+                    if let Some(f) = inference_factor { Value::Duration(a + b * f) } else { return Err("Ambiguous unitless number (cannot infer unit)".into()) }
                 },
                 (Value::Number(a), Value::Duration(b)) => {
-                    if let Some(f) = inference_factor { Ok(Value::Duration(a * f + b)) } else { Err("Ambiguous unitless number (cannot infer unit)".into()) }
+                    if let Some(f) = inference_factor { Value::Duration(a * f + b) } else { return Err("Ambiguous unitless number (cannot infer unit)".into()) }
                 },
-                _ => Err("Cannot add these types".into())
-            }
+                _ => return Err("Cannot add these types".into())
+            };
+            if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
+            Ok(res)
         }
         Expr::Sub(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
-                (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
-                (Value::Duration(a), Value::Duration(b)) => Ok(Value::Duration(a - b)),
+            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let req = l_req.or(r_req);
+
+            let mut res = match (l_val, r_val) {
+                (Value::Number(a), Value::Number(b)) => Value::Number(a - b),
+                (Value::Duration(a), Value::Duration(b)) => Value::Duration(a - b),
                 (Value::Duration(a), Value::Number(b)) => {
-                    if let Some(f) = inference_factor { Ok(Value::Duration(a - b * f)) } else { Err("Ambiguous unitless number (cannot infer unit)".into()) }
+                    if let Some(f) = inference_factor { Value::Duration(a - b * f) } else { return Err("Ambiguous unitless number (cannot infer unit)".into()) }
                 },
                 (Value::Number(a), Value::Duration(b)) => {
-                    if let Some(f) = inference_factor { Ok(Value::Duration(a * f - b)) } else { Err("Ambiguous unitless number (cannot infer unit)".into()) }
+                    if let Some(f) = inference_factor { Value::Duration(a * f - b) } else { return Err("Ambiguous unitless number (cannot infer unit)".into()) }
                 },
-                _ => Err("Cannot subtract these types".into())
-            }
+                _ => return Err("Cannot subtract these types".into())
+            };
+            if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
+            Ok(res)
         }
         Expr::Mul(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
-                (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
-                (Value::Number(a), Value::Duration(b)) | (Value::Duration(b), Value::Number(a)) => Ok(Value::Duration(a * b)),
-                _ => Err("Cannot multiply two time durations explicitly".into())
-            }
+            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let req = l_req.or(r_req);
+
+            let mut res = match (l_val, r_val) {
+                (Value::Number(a), Value::Number(b)) => Value::Number(a * b),
+                (Value::Number(a), Value::Duration(b)) | (Value::Duration(b), Value::Number(a)) => Value::Duration(a * b),
+                _ => return Err("Cannot multiply two time durations explicitly".into())
+            };
+            if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
+            Ok(res)
         }
         Expr::Div(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
-                (Value::Number(a), Value::Number(b)) => if b.is_zero() { Err("Division by zero".into()) } else { Ok(Value::Number(a / b)) },
-                (Value::Duration(a), Value::Number(b)) => if b.is_zero() { Err("Division by zero".into()) } else { Ok(Value::Duration(a / b)) },
-                (Value::Duration(a), Value::Duration(b)) => if b.is_zero() { Err("Division by zero".into()) } else { Ok(Value::Number(a / b)) },
-                _ => Err("Cannot divide a number by a time duration".into())
-            }
+            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let req = l_req.or(r_req);
+
+            let mut res = match (l_val, r_val) {
+                (Value::Number(a), Value::Number(b)) => if b.is_zero() { return Err("Division by zero".into()) } else { Value::Number(a / b) },
+                (Value::Duration(a), Value::Number(b)) => if b.is_zero() { return Err("Division by zero".into()) } else { Value::Duration(a / b) },
+                (Value::Duration(a), Value::Duration(b)) => if b.is_zero() { return Err("Division by zero".into()) } else { Value::Number(a / b) },
+                _ => return Err("Cannot divide a number by a time duration".into())
+            };
+            if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
+            Ok(res)
         }
         Expr::Mod(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
-                (Value::Number(a), Value::Number(b)) => if b.is_zero() { Err("Modulo by zero".into()) } else { Ok(Value::Number(a % b)) },
-                (Value::Duration(a), Value::Duration(b)) => if b.is_zero() { Err("Modulo by zero".into()) } else { Ok(Value::Duration(a % b)) },
+            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let req = l_req.or(r_req);
+
+            let mut res = match (l_val, r_val) {
+                (Value::Number(a), Value::Number(b)) => if b.is_zero() { return Err("Modulo by zero".into()) } else { Value::Number(a % b) },
+                (Value::Duration(a), Value::Duration(b)) => if b.is_zero() { return Err("Modulo by zero".into()) } else { Value::Duration(a % b) },
                 (Value::Duration(a), Value::Number(b)) => {
                     if let Some(f) = inference_factor {
                         let scaled_b = b * f;
-                        if scaled_b.is_zero() { Err("Modulo by zero".into()) } else { Ok(Value::Duration(a % scaled_b)) }
+                        if scaled_b.is_zero() { return Err("Modulo by zero".into()) } else { Value::Duration(a % scaled_b) }
                     } else {
-                        Err("Ambiguous unitless number (cannot infer unit)".into())
+                        return Err("Ambiguous unitless number (cannot infer unit)".into())
                     }
                 },
                 (Value::Number(a), Value::Duration(b)) => {
                     if let Some(f) = inference_factor {
                         let scaled_a = a * f;
-                        if b.is_zero() { Err("Modulo by zero".into()) } else { Ok(Value::Duration(scaled_a % b)) }
+                        if b.is_zero() { return Err("Modulo by zero".into()) } else { Value::Duration(scaled_a % b) }
                     } else {
-                        Err("Ambiguous unitless number (cannot infer unit)".into())
+                        return Err("Ambiguous unitless number (cannot infer unit)".into())
                     }
                 },
-                _ => Err("Cannot modulo these types".into())
-            }
+                _ => return Err("Cannot modulo these types".into())
+            };
+            if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
+            Ok(res)
         }
-        Expr::Apply(lhs, rhs) => apply_values(eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?, env, registry, funcs, last_val, inference_factor)
+        Expr::Apply(lhs, rhs) => {
+            let l_eval = eval(lhs, env, registry, funcs, last_val, inference_factor)?;
+            let r_eval = eval(rhs, env, registry, funcs, last_val, inference_factor)?;
+            apply_values(l_eval, r_eval, env, registry, funcs, last_val, inference_factor)
+        }
     }
 }
 
@@ -602,10 +679,15 @@ fn format_exact_decimal(r: &BigRational, places: i32) -> (String, bool) {
     (s, is_approx)
 }
 
-fn format_output(result: &Value, conv_req: &ConversionTarget, explicit_units: &[FormatUnit], registry: &[UnitDef]) -> String {
-    match result {
+fn format_output(result: &Value, top_conv_req: &ConversionTarget, explicit_units: &[FormatUnit], registry: &[UnitDef]) -> String {
+    let (val, val_req) = result.clone().unwrap();
+    
+    let empty_target = ConversionTarget::default();
+    let conv_req = if !top_conv_req.is_empty() { top_conv_req } else if let Some(ref r) = val_req { r } else { &empty_target };
+
+    match val {
         Value::Number(n) => {
-            let is_neg = n < &BigRational::zero();
+            let is_neg = n < BigRational::zero();
             let abs_n = if is_neg { -n } else { n.clone() };
             let places = conv_req.dp.unwrap_or(9);
             let (val_str, is_approx) = format_exact_decimal(&abs_n, places);
@@ -621,6 +703,7 @@ fn format_output(result: &Value, conv_req: &ConversionTarget, explicit_units: &[
         }
         Value::Duration(d) => format_duration(d.clone(), conv_req, explicit_units, registry),
         Value::Function(f, _) => format!("<function {}>", f.name),
+        Value::Formatted(..) => unreachable!(),
     }
 }
 
@@ -727,14 +810,18 @@ fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &
             }
         }
         
-        let (mut rhs_tokens, _) = form_durations(rhs.to_vec(), registry)?;
+        let mut rhs_vec = rhs.to_vec();
+        let conv_req = extract_keywords(&mut rhs_vec, registry)?;
+        
+        let (mut rhs_tokens, _) = form_durations(rhs_vec, registry)?;
         rhs_tokens = combine_contiguous_durations(rhs_tokens);
         
         let (body, rest) = parse_expr(&rhs_tokens)?;
         if !rest.is_empty() { return Err("Incomplete expression in function body".to_string()); }
         
+        let req = if conv_req.is_empty() { None } else { Some(conv_req) };
         funcs.retain(|f| f.name != func_name);
-        funcs.push(FuncDef { name: func_name, aliases: vec![], args, body });
+        funcs.push(FuncDef { name: func_name, aliases: vec![], args, body, conv_req: req });
         
         return Ok(("".to_string(), None)); 
     }
