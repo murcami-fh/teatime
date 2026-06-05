@@ -9,7 +9,7 @@ use crossterm::{
 use directories::ProjectDirs;
 use num_bigint::BigInt;
 use num_rational::BigRational;
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::{ToPrimitive, Zero};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -130,6 +130,7 @@ enum Token {
     Num(BigRational),
     Ident(String),
     Plus, Minus, Multiply, Divide, Modulo, Underscore, LParen, RParen, To, Now,
+    Assign, // Represents :=
     Duration(BigRational),
 }
 
@@ -170,6 +171,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
         else if c == '_' { tokens.push(Token::Underscore); chars.next(); } 
         else if c == '(' { tokens.push(Token::LParen); chars.next(); } 
         else if c == ')' { tokens.push(Token::RParen); chars.next(); } 
+        else if c == ':' { 
+            chars.next();
+            if let Some(&'=') = chars.peek() {
+                tokens.push(Token::Assign);
+                chars.next();
+            } else {
+                return Err("Unexpected character: ':' (did you mean ':='?)".to_string());
+            }
+        } 
         else if c.is_ascii_digit() || c == '.' {
             let mut num_str = String::new();
             while let Some(&ch) = chars.peek() {
@@ -206,7 +216,7 @@ fn build_registry() -> (Vec<UnitDef>, Vec<FuncDef>) {
             if let Ok(config) = toml::from_str::<Config>(&config_str) {
                 if let Some(units) = config.units {
                     for (name, conf) in units {
-                        if let Ok((_, Value::Duration(seconds))) = evaluate(&conf.value, None, &registry, &funcs) {
+                        if let Ok((_, Some(Value::Duration(seconds)))) = evaluate(&conf.value, None, &registry, &mut funcs) {
                             registry.push(UnitDef { primary_name: name, factor: seconds, aliases: conf.alias });
                         }
                     }
@@ -248,7 +258,7 @@ fn extract_keywords(tokens: &mut Vec<Token>, registry: &[UnitDef]) -> Result<Con
         if tokens[i] == Token::To {
             tokens.remove(i);
             let mut args = Vec::new();
-            while i < tokens.len() && !matches!(tokens[i], Token::Plus | Token::Minus | Token::Multiply | Token::Divide | Token::Modulo | Token::LParen | Token::RParen | Token::To) {
+            while i < tokens.len() && !matches!(tokens[i], Token::Plus | Token::Minus | Token::Multiply | Token::Divide | Token::Modulo | Token::LParen | Token::RParen | Token::To | Token::Assign) {
                 args.push(tokens.remove(i));
             }
             
@@ -640,10 +650,42 @@ fn format_duration(mut total_seconds: BigRational, conv_req: &ConversionTarget, 
 
 // --- 6. Evaluator Entry ---
 
-fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &[FuncDef]) -> Result<(String, Value), String> {
+fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &mut Vec<FuncDef>) -> Result<(String, Option<Value>), String> {
     let mut tokens = tokenize(input)?;
-    if tokens.is_empty() { return Ok(("".to_string(), Value::Number(BigRational::zero()))); }
+    if tokens.is_empty() { return Ok(("".to_string(), Some(Value::Number(BigRational::zero())))); }
 
+    // Check for top-level assignment definition
+    if let Some(pos) = tokens.iter().position(|t| *t == Token::Assign) {
+        let lhs = &tokens[..pos];
+        let rhs = &tokens[pos+1..];
+        
+        if lhs.is_empty() { return Err("Missing function name".to_string()); }
+        
+        let mut func_name = String::new();
+        let mut args = Vec::new();
+        
+        for (i, tok) in lhs.iter().enumerate() {
+            if let Token::Ident(name) = tok {
+                if i == 0 { func_name = name.clone(); }
+                else { args.push(name.clone()); }
+            } else {
+                return Err("Invalid function definition: left side must be identifiers".to_string());
+            }
+        }
+        
+        let (mut rhs_tokens, _) = form_durations(rhs.to_vec(), registry)?;
+        rhs_tokens = combine_contiguous_durations(rhs_tokens);
+        
+        let (body, rest) = parse_expr(&rhs_tokens)?;
+        if !rest.is_empty() { return Err("Incomplete expression in function body".to_string()); }
+        
+        funcs.retain(|f| f.name != func_name);
+        funcs.push(FuncDef { name: func_name, aliases: vec![], args, body });
+        
+        return Ok(("".to_string(), None)); // No console output for function definitions
+    }
+
+    // Standard Math Evaluator path 
     let conv_req = extract_keywords(&mut tokens, registry)?;
     let (mut tokens, mut explicit_units) = form_durations(tokens, registry)?;
     
@@ -663,7 +705,7 @@ fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &
     }
 
     let result = eval(&ast, &HashMap::new(), registry, funcs, last_val.as_ref(), inference_factor.as_ref())?;
-    Ok((format_output(&result, &conv_req, &explicit_units, registry), result))
+    Ok((format_output(&result, &conv_req, &explicit_units, registry), Some(result)))
 }
 
 // --- 7. Interactive UI Loop ---
@@ -673,7 +715,7 @@ fn main() -> io::Result<()> {
     terminal::enable_raw_mode()?;
     let _guard = RawModeGuard;
     
-    let (registry, funcs) = build_registry();
+    let (registry, mut funcs) = build_registry();
 
     let mut history: Vec<String> = Vec::new();
     let mut history_index: usize = 0;
@@ -694,7 +736,7 @@ fn main() -> io::Result<()> {
         
         let trimmed = input.trim();
         if !trimmed.is_empty() {
-            if let Ok((res, _)) = evaluate(trimmed, last_value.clone(), &registry, &funcs) {
+            if let Ok((res, _)) = evaluate(trimmed, last_value.clone(), &registry, &mut funcs) {
                 if !res.is_empty() {
                     queue!(
                         stdout,
@@ -748,10 +790,14 @@ fn main() -> io::Result<()> {
                     queue!(stdout, Print(format!("> {}\r\n", input)))?;
                     
                     if !trimmed.is_empty() {
-                        match evaluate(&trimmed, last_value.clone(), &registry, &funcs) {
-                            Ok((res, val)) => {
-                                queue!(stdout, Print(format!("{}\r\n", res)))?;
-                                last_value = Some(val); 
+                        match evaluate(&trimmed, last_value.clone(), &registry, &mut funcs) {
+                            Ok((res, val_opt)) => {
+                                if !res.is_empty() {
+                                    queue!(stdout, Print(format!("{}\r\n", res)))?;
+                                }
+                                if let Some(val) = val_opt {
+                                    last_value = Some(val); 
+                                }
                             }
                             Err(_) => {}
                         }
