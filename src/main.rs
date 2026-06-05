@@ -63,7 +63,7 @@ struct FuncDef {
     aliases: Vec<String>,
     args: Vec<String>,
     body: Expr,
-    conv_req: Option<ConversionTarget>, // Preserves 'to ...' formatting
+    conv_req: Option<ConversionTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +83,8 @@ impl FormatUnit {
 #[derive(Clone, Debug)]
 enum Expr {
     Number(BigRational),
-    Duration(BigRational), 
+    Duration(BigRational),
+    String(String),
     Ident(String),
     Now,
     Underscore,
@@ -100,8 +101,9 @@ enum Expr {
 enum Value {
     Number(BigRational),
     Duration(BigRational),
+    String(String),
     Function(FuncDef, Vec<Value>),
-    Formatted(Box<Value>, ConversionTarget), // Bubbles formatting requests to the top level
+    Formatted(Box<Value>, ConversionTarget),
 }
 
 impl Value {
@@ -109,7 +111,6 @@ impl Value {
         match self {
             Value::Formatted(inner, req) => {
                 let (v, inner_req) = inner.unwrap();
-                // Outermost request takes precedence
                 (v, Some(req).or(inner_req))
             }
             _ => (self, None)
@@ -144,6 +145,7 @@ impl Expr {
 enum Token {
     Num(BigRational),
     Ident(String),
+    String(String),
     Plus, Minus, Multiply, Divide, Modulo, Underscore, LParen, RParen, To, Now,
     Assign,
     Duration(BigRational),
@@ -185,14 +187,14 @@ fn clean_tokens(tokens: Vec<Token>) -> Vec<Token> {
     while i < tokens.len() {
         if tokens[i] == Token::Space {
             let left_is_operand = if i > 0 {
-                matches!(tokens[i-1], Token::Num(_) | Token::Duration(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::RParen)
+                matches!(tokens[i-1], Token::Num(_) | Token::Duration(_) | Token::String(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::RParen)
             } else { false };
             
             let mut j = i + 1;
             while j < tokens.len() && tokens[j] == Token::Space { j += 1; }
             
             let right_is_operand = if j < tokens.len() {
-                matches!(tokens[j], Token::Num(_) | Token::Duration(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::LParen)
+                matches!(tokens[j], Token::Num(_) | Token::Duration(_) | Token::String(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::LParen)
             } else { false };
 
             if left_is_operand && right_is_operand {
@@ -219,6 +221,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             }
             tokens.push(Token::Space);
         } 
+        else if c == '"' || c == '\'' {
+            let quote = c;
+            chars.next();
+            let mut s = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch == quote { chars.next(); break; }
+                s.push(ch); chars.next();
+            }
+            tokens.push(Token::String(s));
+        }
         else if c == '+' { tokens.push(Token::Plus); chars.next(); } 
         else if c == '-' { tokens.push(Token::Minus); chars.next(); } 
         else if c == '*' { tokens.push(Token::Multiply); chars.next(); } 
@@ -230,8 +242,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
         else if c == ':' { 
             chars.next();
             if let Some(&'=') = chars.peek() {
-                tokens.push(Token::Assign);
-                chars.next();
+                tokens.push(Token::Assign); chars.next();
             } else {
                 return Err("Unexpected character: ':' (did you mean ':='?)".to_string());
             }
@@ -368,8 +379,10 @@ fn form_durations(tokens: Vec<Token>, registry: &[UnitDef]) -> Result<(Vec<Token
                     }
                 }
             }
+            new_tokens.push(Token::Num(val.clone())); 
+        } else {
+            new_tokens.push(tokens[i].clone());
         }
-        new_tokens.push(tokens[i].clone());
         i += 1;
     }
     Ok((new_tokens, explicit_units))
@@ -443,7 +456,7 @@ fn parse_nospace_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     let (mut lhs, mut rest) = parse_primary(tokens)?;
     while !rest.is_empty() {
         match rest[0] {
-            Token::Num(_) | Token::Duration(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::LParen => {
+            Token::Num(_) | Token::Duration(_) | Token::String(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::LParen => {
                 let (rhs, new_rest) = parse_primary(rest)?;
                 lhs = Expr::Apply(Box::new(lhs), Box::new(rhs));
                 rest = new_rest;
@@ -459,6 +472,7 @@ fn parse_primary(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     match &tokens[0] {
         Token::Num(n) => Ok((Expr::Number(n.clone()), &tokens[1..])),
         Token::Duration(d) => Ok((Expr::Duration(d.clone()), &tokens[1..])), 
+        Token::String(s) => Ok((Expr::String(s.clone()), &tokens[1..])),
         Token::Ident(s) => Ok((Expr::Ident(s.clone()), &tokens[1..])),
         Token::Now => Ok((Expr::Now, &tokens[1..])),
         Token::Underscore => Ok((Expr::Underscore, &tokens[1..])),
@@ -478,10 +492,19 @@ fn parse_primary(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
 
 // --- 4. Evaluator (Resolves functions, args & math) ---
 
-fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>) -> Result<Value, String> {
-    let (l_val, l_req) = l.unwrap();
-    let (r_val, r_req) = r.unwrap();
+fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>, explicit_units: &[FormatUnit]) -> Result<Value, String> {
+    let (l_val, l_req) = l.clone().unwrap();
+    let (r_val, r_req) = r.clone().unwrap();
     let req = l_req.or(r_req);
+
+    if matches!(l_val, Value::String(_)) || matches!(r_val, Value::String(_)) {
+        let empty = ConversionTarget::default();
+        let l_s = format_value(&l, &empty, explicit_units, registry);
+        let r_s = format_value(&r, &empty, explicit_units, registry);
+        let mut res = Value::String(format!("{}{}", l_s, r_s));
+        if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
+        return Ok(res);
+    }
 
     let mut res = match (l_val, r_val) {
         (Value::Number(a), Value::Number(b)) => Value::Number(a * b),
@@ -495,10 +518,8 @@ fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[Un
                 for (name, val) in f.args.iter().zip(args.into_iter()) {
                     new_env.insert(name.clone(), val);
                 }
-                let mut val = eval(&f.body, &new_env, registry, funcs, last_val, inference_factor)?;
-                if let Some(f_req) = &f.conv_req {
-                    val = Value::Formatted(Box::new(val), f_req.clone());
-                }
+                let mut val = eval(&f.body, &new_env, registry, funcs, last_val, inference_factor, explicit_units)?;
+                if let Some(f_req) = &f.conv_req { val = Value::Formatted(Box::new(val), f_req.clone()); }
                 val
             } else {
                 Value::Function(f, args)
@@ -511,10 +532,11 @@ fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[Un
     Ok(res)
 }
 
-fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>) -> Result<Value, String> {
+fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>, explicit_units: &[FormatUnit]) -> Result<Value, String> {
     match expr {
         Expr::Number(n) => Ok(Value::Number(n.clone())),
         Expr::Duration(d) => Ok(Value::Duration(d.clone())),
+        Expr::String(s) => Ok(Value::String(s.clone())),
         Expr::Ident(name) => {
             if let Some(val) = env.get(name) { return Ok(val.clone()); }
             let name_lower = name.to_lowercase();
@@ -526,10 +548,8 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             for def in funcs {
                 if def.name.to_lowercase() == name_lower || def.aliases.iter().any(|a| a.to_lowercase() == name_lower) {
                     if def.args.is_empty() { 
-                        let mut val = eval(&def.body, env, registry, funcs, last_val, inference_factor)?; 
-                        if let Some(req) = &def.conv_req {
-                            val = Value::Formatted(Box::new(val), req.clone());
-                        }
+                        let mut val = eval(&def.body, env, registry, funcs, last_val, inference_factor, explicit_units)?; 
+                        if let Some(req) = &def.conv_req { val = Value::Formatted(Box::new(val), req.clone()); }
                         return Ok(val);
                     }
                     return Ok(Value::Function(def.clone(), vec![]));
@@ -540,20 +560,32 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
         Expr::Now => Ok(Value::Duration(BigRational::from_integer(BigInt::from(chrono::Local::now().num_seconds_from_midnight())))),
         Expr::Underscore => last_val.cloned().ok_or("No previous value to reference".into()),
         Expr::UnaryMinus(e) => {
-            let (v_val, req) = eval(e, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let (v_val, req) = eval(e, env, registry, funcs, last_val, inference_factor, explicit_units)?.unwrap();
             let mut res = match v_val {
                 Value::Number(n) => Value::Number(-n),
                 Value::Duration(d) => Value::Duration(-d),
+                Value::String(_) => return Err("Cannot negate a string".into()),
                 Value::Function(..) => return Err("Cannot negate a function".into()),
-                Value::Formatted(..) => unreachable!(), // Stripped by unwrap()
+                Value::Formatted(..) => unreachable!(), 
             };
             if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
             Ok(res)
         }
         Expr::Add(lhs, rhs) => {
-            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
-            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let l_full = eval(lhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let r_full = eval(rhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let (l_val, l_req) = l_full.clone().unwrap();
+            let (r_val, r_req) = r_full.clone().unwrap();
             let req = l_req.or(r_req);
+
+            if matches!(l_val, Value::String(_)) || matches!(r_val, Value::String(_)) {
+                let empty = ConversionTarget::default();
+                let l_s = format_value(&l_full, &empty, explicit_units, registry);
+                let r_s = format_value(&r_full, &empty, explicit_units, registry);
+                let mut res = Value::String(format!("{}{}", l_s, r_s));
+                if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
+                return Ok(res);
+            }
 
             let mut res = match (l_val, r_val) {
                 (Value::Number(a), Value::Number(b)) => Value::Number(a + b),
@@ -570,9 +602,13 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             Ok(res)
         }
         Expr::Sub(lhs, rhs) => {
-            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
-            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let l_full = eval(lhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let r_full = eval(rhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let (l_val, l_req) = l_full.clone().unwrap();
+            let (r_val, r_req) = r_full.clone().unwrap();
             let req = l_req.or(r_req);
+
+            if matches!(l_val, Value::String(_)) || matches!(r_val, Value::String(_)) { return Err("Cannot subtract strings".into()); }
 
             let mut res = match (l_val, r_val) {
                 (Value::Number(a), Value::Number(b)) => Value::Number(a - b),
@@ -589,9 +625,13 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             Ok(res)
         }
         Expr::Mul(lhs, rhs) => {
-            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
-            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let l_full = eval(lhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let r_full = eval(rhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let (l_val, l_req) = l_full.clone().unwrap();
+            let (r_val, r_req) = r_full.clone().unwrap();
             let req = l_req.or(r_req);
+
+            if matches!(l_val, Value::String(_)) || matches!(r_val, Value::String(_)) { return Err("Cannot multiply strings".into()); }
 
             let mut res = match (l_val, r_val) {
                 (Value::Number(a), Value::Number(b)) => Value::Number(a * b),
@@ -602,9 +642,13 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             Ok(res)
         }
         Expr::Div(lhs, rhs) => {
-            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
-            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let l_full = eval(lhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let r_full = eval(rhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let (l_val, l_req) = l_full.clone().unwrap();
+            let (r_val, r_req) = r_full.clone().unwrap();
             let req = l_req.or(r_req);
+
+            if matches!(l_val, Value::String(_)) || matches!(r_val, Value::String(_)) { return Err("Cannot divide strings".into()); }
 
             let mut res = match (l_val, r_val) {
                 (Value::Number(a), Value::Number(b)) => if b.is_zero() { return Err("Division by zero".into()) } else { Value::Number(a / b) },
@@ -616,9 +660,13 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             Ok(res)
         }
         Expr::Mod(lhs, rhs) => {
-            let (l_val, l_req) = eval(lhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
-            let (r_val, r_req) = eval(rhs, env, registry, funcs, last_val, inference_factor)?.unwrap();
+            let l_full = eval(lhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let r_full = eval(rhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let (l_val, l_req) = l_full.clone().unwrap();
+            let (r_val, r_req) = r_full.clone().unwrap();
             let req = l_req.or(r_req);
+
+            if matches!(l_val, Value::String(_)) || matches!(r_val, Value::String(_)) { return Err("Cannot modulo strings".into()); }
 
             let mut res = match (l_val, r_val) {
                 (Value::Number(a), Value::Number(b)) => if b.is_zero() { return Err("Modulo by zero".into()) } else { Value::Number(a % b) },
@@ -645,9 +693,9 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             Ok(res)
         }
         Expr::Apply(lhs, rhs) => {
-            let l_eval = eval(lhs, env, registry, funcs, last_val, inference_factor)?;
-            let r_eval = eval(rhs, env, registry, funcs, last_val, inference_factor)?;
-            apply_values(l_eval, r_eval, env, registry, funcs, last_val, inference_factor)
+            let l_eval = eval(lhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let r_eval = eval(rhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            apply_values(l_eval, r_eval, env, registry, funcs, last_val, inference_factor, explicit_units)
         }
     }
 }
@@ -679,13 +727,14 @@ fn format_exact_decimal(r: &BigRational, places: i32) -> (String, bool) {
     (s, is_approx)
 }
 
-fn format_output(result: &Value, top_conv_req: &ConversionTarget, explicit_units: &[FormatUnit], registry: &[UnitDef]) -> String {
+fn format_value(result: &Value, top_conv_req: &ConversionTarget, explicit_units: &[FormatUnit], registry: &[UnitDef]) -> String {
     let (val, val_req) = result.clone().unwrap();
     
     let empty_target = ConversionTarget::default();
     let conv_req = if !top_conv_req.is_empty() { top_conv_req } else if let Some(ref r) = val_req { r } else { &empty_target };
 
     match val {
+        Value::String(s) => s,
         Value::Number(n) => {
             let is_neg = n < BigRational::zero();
             let abs_n = if is_neg { -n } else { n.clone() };
@@ -844,8 +893,8 @@ fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &
         inference_factor = Some(explicit_units[0].factor.clone()); 
     }
 
-    let result = eval(&ast, &HashMap::new(), registry, funcs, last_val.as_ref(), inference_factor.as_ref())?;
-    Ok((format_output(&result, &conv_req, &explicit_units, registry), Some(result)))
+    let result = eval(&ast, &HashMap::new(), registry, funcs, last_val.as_ref(), inference_factor.as_ref(), &explicit_units)?;
+    Ok((format_value(&result, &conv_req, &explicit_units, registry), Some(result)))
 }
 
 // --- 7. Interactive UI Loop ---
