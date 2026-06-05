@@ -132,6 +132,7 @@ enum Token {
     Plus, Minus, Multiply, Divide, Modulo, Underscore, LParen, RParen, To, Now,
     Assign,
     Duration(BigRational),
+    Space, // Required for intelligent semantic associativity
 }
 
 #[derive(Default, Debug, Clone)]
@@ -157,12 +158,46 @@ fn parse_decimal(s: &str) -> Result<BigRational, String> {
     }
 }
 
+fn clean_tokens(tokens: Vec<Token>) -> Vec<Token> {
+    let mut res = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == Token::Space {
+            let left_is_operand = if i > 0 {
+                matches!(tokens[i-1], Token::Num(_) | Token::Duration(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::RParen)
+            } else { false };
+            
+            let mut j = i + 1;
+            while j < tokens.len() && tokens[j] == Token::Space { j += 1; }
+            
+            let right_is_operand = if j < tokens.len() {
+                matches!(tokens[j], Token::Num(_) | Token::Duration(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::LParen)
+            } else { false };
+
+            if left_is_operand && right_is_operand {
+                res.push(Token::Space);
+            }
+            i = j;
+        } else {
+            res.push(tokens[i].clone());
+            i += 1;
+        }
+    }
+    res
+}
+
 fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
 
     while let Some(&c) = chars.peek() {
-        if c.is_whitespace() { chars.next(); } 
+        if c.is_whitespace() { 
+            chars.next(); 
+            while let Some(&nc) = chars.peek() {
+                if nc.is_whitespace() { chars.next(); } else { break; }
+            }
+            tokens.push(Token::Space);
+        } 
         else if c == '+' { tokens.push(Token::Plus); chars.next(); } 
         else if c == '-' { tokens.push(Token::Minus); chars.next(); } 
         else if c == '*' { tokens.push(Token::Multiply); chars.next(); } 
@@ -198,7 +233,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             return Err(format!("Unexpected character: '{}'", c));
         }
     }
-    Ok(tokens)
+    Ok(clean_tokens(tokens))
 }
 
 fn build_registry() -> (Vec<UnitDef>, Vec<FuncDef>) {
@@ -290,23 +325,27 @@ fn extract_keywords(tokens: &mut Vec<Token>, registry: &[UnitDef]) -> Result<Con
 fn form_durations(tokens: Vec<Token>, registry: &[UnitDef]) -> Result<(Vec<Token>, Vec<FormatUnit>), String> {
     let mut new_tokens = Vec::new();
     let mut explicit_units = Vec::new();
-    let mut iter = tokens.into_iter().peekable();
+    let mut i = 0;
 
-    while let Some(tok) = iter.next() {
-        if let Token::Num(val) = tok {
-            if let Some(Token::Ident(unit)) = iter.peek() {
-                if let Ok(fmt_unit) = parse_single_unit(unit, registry) {
-                    if !explicit_units.contains(&fmt_unit) { explicit_units.push(fmt_unit.clone()); }
-                    let (sec, _) = fmt_unit.info();
-                    new_tokens.push(Token::Duration(val * sec));
-                    iter.next(); 
-                    continue;
+    // Intelligently binds Num and Ident even if separated by Space
+    while i < tokens.len() {
+        if let Token::Num(ref val) = tokens[i] {
+            let mut j = i + 1;
+            while j < tokens.len() && tokens[j] == Token::Space { j += 1; }
+            if j < tokens.len() {
+                if let Token::Ident(ref unit) = tokens[j] {
+                    if let Ok(fmt_unit) = parse_single_unit(unit, registry) {
+                        if !explicit_units.contains(&fmt_unit) { explicit_units.push(fmt_unit.clone()); }
+                        let (sec, _) = fmt_unit.info();
+                        new_tokens.push(Token::Duration(val * sec));
+                        i = j + 1;
+                        continue;
+                    }
                 }
             }
-            new_tokens.push(Token::Num(val)); 
-        } else {
-            new_tokens.push(tok);
         }
+        new_tokens.push(tokens[i].clone());
+        i += 1;
     }
     Ok((new_tokens, explicit_units))
 }
@@ -315,6 +354,7 @@ fn combine_contiguous_durations(tokens: Vec<Token>) -> Vec<Token> {
     let mut new_tokens: Vec<Token> = Vec::new();
     for tok in tokens {
         if let Token::Duration(val) = tok {
+            // Space acts as a barrier protecting durations from combination
             if let Some(Token::Duration(last_val)) = new_tokens.last_mut() {
                 *last_val = last_val.clone() + val; 
             } else {
@@ -344,18 +384,18 @@ fn parse_expr(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
 }
 
 fn parse_mul_expr(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
-    let (mut lhs, mut rest) = parse_app_expr(tokens)?;
+    let (mut lhs, mut rest) = parse_space_app(tokens)?;
     while !rest.is_empty() {
         if rest[0] == Token::Multiply {
-            let (rhs, new_rest) = parse_app_expr(&rest[1..])?;
+            let (rhs, new_rest) = parse_space_app(&rest[1..])?;
             lhs = Expr::Mul(Box::new(lhs), Box::new(rhs));
             rest = new_rest;
         } else if rest[0] == Token::Divide {
-            let (rhs, new_rest) = parse_app_expr(&rest[1..])?;
+            let (rhs, new_rest) = parse_space_app(&rest[1..])?;
             lhs = Expr::Div(Box::new(lhs), Box::new(rhs));
             rest = new_rest;
         } else if rest[0] == Token::Modulo {
-            let (rhs, new_rest) = parse_app_expr(&rest[1..])?;
+            let (rhs, new_rest) = parse_space_app(&rest[1..])?;
             lhs = Expr::Mod(Box::new(lhs), Box::new(rhs));
             rest = new_rest;
         } else { break; }
@@ -363,7 +403,21 @@ fn parse_mul_expr(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     Ok((lhs, rest))
 }
 
-fn parse_app_expr(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
+// Left-associative function application delimited by spaces 
+fn parse_space_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
+    let (mut lhs, mut rest) = parse_nospace_app(tokens)?;
+    while !rest.is_empty() {
+        if rest[0] == Token::Space {
+            let (rhs, new_rest) = parse_nospace_app(&rest[1..])?;
+            lhs = Expr::Apply(Box::new(lhs), Box::new(rhs));
+            rest = new_rest;
+        } else { break; }
+    }
+    Ok((lhs, rest))
+}
+
+// Tighter binding application with no spaces (e.g. 5h30m or f(x))
+fn parse_nospace_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     let (mut lhs, mut rest) = parse_primary(tokens)?;
     while !rest.is_empty() {
         match rest[0] {
@@ -663,9 +717,10 @@ fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &
         let mut func_name = String::new();
         let mut args = Vec::new();
         
-        for (i, tok) in lhs.iter().enumerate() {
+        for tok in lhs.iter() {
+            if *tok == Token::Space { continue; }
             if let Token::Ident(name) = tok {
-                if i == 0 { func_name = name.clone(); }
+                if func_name.is_empty() { func_name = name.clone(); }
                 else { args.push(name.clone()); }
             } else {
                 return Err("Invalid function definition: left side must be identifiers".to_string());
