@@ -82,7 +82,7 @@ impl FormatUnit {
 #[derive(Clone, Debug)]
 enum Expr {
     Number(BigRational),
-    Duration(BigRational), // Preserves unit context passing from CLI into AST
+    Duration(BigRational), 
     Ident(String),
     Now,
     Underscore,
@@ -121,21 +121,6 @@ impl Expr {
             _ => {}
         }
     }
-
-    fn infer_numbers(&mut self, unit_name: &str) {
-        match self {
-            Expr::Number(_) => {
-                let old = std::mem::replace(self, Expr::Now); 
-                *self = Expr::Apply(Box::new(old), Box::new(Expr::Ident(unit_name.to_string())));
-            }
-            Expr::UnaryMinus(e) => e.infer_numbers(unit_name),
-            Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) | Expr::Mod(a, b) | Expr::Apply(a, b) => {
-                a.infer_numbers(unit_name);
-                b.infer_numbers(unit_name);
-            }
-            _ => {}
-        }
-    }
 }
 
 // --- 2. Tokenization & Loading ---
@@ -148,9 +133,10 @@ enum Token {
     Duration(BigRational),
 }
 
-enum ConversionTarget {
-    Dp(i32),
-    Units(Vec<FormatUnit>),
+#[derive(Default, Debug, Clone)]
+struct ConversionTarget {
+    dp: Option<i32>,
+    units: Option<Vec<FormatUnit>>,
 }
 
 fn parse_decimal(s: &str) -> Result<BigRational, String> {
@@ -255,8 +241,8 @@ fn parse_single_unit(u: &str, registry: &[UnitDef]) -> Result<FormatUnit, String
     Err(format!("Unknown unit: '{}'", u))
 }
 
-fn extract_keywords(tokens: &mut Vec<Token>, registry: &[UnitDef]) -> Result<Option<ConversionTarget>, String> {
-    let mut target = None;
+fn extract_keywords(tokens: &mut Vec<Token>, registry: &[UnitDef]) -> Result<ConversionTarget, String> {
+    let mut target = ConversionTarget::default();
     let mut i = 0;
     while i < tokens.len() {
         if tokens[i] == Token::To {
@@ -265,19 +251,25 @@ fn extract_keywords(tokens: &mut Vec<Token>, registry: &[UnitDef]) -> Result<Opt
             while i < tokens.len() && !matches!(tokens[i], Token::Plus | Token::Minus | Token::Multiply | Token::Divide | Token::Modulo | Token::LParen | Token::RParen | Token::To) {
                 args.push(tokens.remove(i));
             }
+            
+            if args.is_empty() {
+                return Err("Missing target after conversion keyword".to_string());
+            }
+
             if args.len() == 2 {
                 if let (Token::Num(n), Token::Ident(u)) = (&args[0], &args[1]) {
                     if u.eq_ignore_ascii_case("decimal") || u.eq_ignore_ascii_case("dp") {
-                        target = Some(ConversionTarget::Dp(n.to_integer().to_i32().unwrap_or(0)));
+                        target.dp = Some(n.to_integer().to_i32().unwrap_or(0));
                         continue;
                     }
                 }
             }
+            
             let mut units = Vec::new();
             for tok in args {
                 if let Token::Ident(u) = tok { units.push(parse_single_unit(&u, registry)?); } else { return Err("Invalid conversion target".into()); }
             }
-            target = Some(ConversionTarget::Units(units));
+            target.units = Some(units);
         } else {
             i += 1;
         }
@@ -303,40 +295,10 @@ fn form_durations(tokens: Vec<Token>, registry: &[UnitDef]) -> Result<(Vec<Token
             }
             new_tokens.push(Token::Num(val)); 
         } else {
-            // Token::Now and Token::Underscore safely pass through directly to AST!
             new_tokens.push(tok);
         }
     }
     Ok((new_tokens, explicit_units))
-}
-
-fn resolve_unitless(
-    tokens: Vec<Token>, 
-    explicit_units: &[FormatUnit], 
-    conv_req: &Option<ConversionTarget>
-) -> Result<Vec<Token>, String> {
-    let mut inference_unit = None;
-    if let Some(ConversionTarget::Units(units)) = conv_req {
-        if !units.is_empty() { inference_unit = Some(units[0].clone()); }
-    }
-    if inference_unit.is_none() && explicit_units.len() == 1 { inference_unit = Some(explicit_units[0].clone()); }
-
-    let mut new_tokens = Vec::new();
-    for tok in tokens {
-        if let Token::Num(val) = tok {
-            if let Some(unit) = &inference_unit {
-                let (factor, _) = unit.info();
-                new_tokens.push(Token::Duration(val * factor));
-            } else if explicit_units.is_empty() {
-                new_tokens.push(Token::Num(val)); 
-            } else {
-                return Err("Ambiguous unitless number (cannot infer unit)".to_string());
-            }
-        } else {
-            new_tokens.push(tok);
-        }
-    }
-    Ok(new_tokens)
 }
 
 fn combine_contiguous_durations(tokens: Vec<Token>) -> Vec<Token> {
@@ -410,7 +372,7 @@ fn parse_primary(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     if tokens.is_empty() { return Err("Unexpected end of expression".into()); }
     match &tokens[0] {
         Token::Num(n) => Ok((Expr::Number(n.clone()), &tokens[1..])),
-        Token::Duration(d) => Ok((Expr::Duration(d.clone()), &tokens[1..])), // Preserves the unit Context
+        Token::Duration(d) => Ok((Expr::Duration(d.clone()), &tokens[1..])), 
         Token::Ident(s) => Ok((Expr::Ident(s.clone()), &tokens[1..])),
         Token::Now => Ok((Expr::Now, &tokens[1..])),
         Token::Underscore => Ok((Expr::Underscore, &tokens[1..])),
@@ -430,12 +392,12 @@ fn parse_primary(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
 
 // --- 4. Evaluator (Resolves functions, args & math) ---
 
-fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>) -> Result<Value, String> {
+fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>) -> Result<Value, String> {
     match (l, r) {
         (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
         (Value::Number(a), Value::Duration(b)) => Ok(Value::Duration(a * b)),
         (Value::Duration(a), Value::Number(b)) => Ok(Value::Duration(a * b)),
-        (Value::Duration(a), Value::Duration(b)) => Ok(Value::Duration(a + b)), // Simulates Fend's juxtapose-to-add for inline definitions
+        (Value::Duration(a), Value::Duration(b)) => Ok(Value::Duration(a + b)), 
         (Value::Function(f, mut args), v) => {
             args.push(v);
             if args.len() == f.args.len() {
@@ -443,7 +405,7 @@ fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[Un
                 for (name, val) in f.args.iter().zip(args.into_iter()) {
                     new_env.insert(name.clone(), val);
                 }
-                eval(&f.body, &new_env, registry, funcs, last_val)
+                eval(&f.body, &new_env, registry, funcs, last_val, inference_factor)
             } else {
                 Ok(Value::Function(f, args))
             }
@@ -452,7 +414,7 @@ fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[Un
     }
 }
 
-fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>) -> Result<Value, String> {
+fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>) -> Result<Value, String> {
     match expr {
         Expr::Number(n) => Ok(Value::Number(n.clone())),
         Expr::Duration(d) => Ok(Value::Duration(d.clone())),
@@ -466,7 +428,7 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             }
             for def in funcs {
                 if def.name.to_lowercase() == name_lower || def.aliases.iter().any(|a| a.to_lowercase() == name_lower) {
-                    if def.args.is_empty() { return eval(&def.body, env, registry, funcs, last_val); }
+                    if def.args.is_empty() { return eval(&def.body, env, registry, funcs, last_val, inference_factor); }
                     return Ok(Value::Function(def.clone(), vec![]));
                 }
             }
@@ -475,35 +437,47 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
         Expr::Now => Ok(Value::Duration(BigRational::from_integer(BigInt::from(chrono::Local::now().num_seconds_from_midnight())))),
         Expr::Underscore => last_val.cloned().ok_or("No previous value to reference".into()),
         Expr::UnaryMinus(e) => {
-            match eval(e, env, registry, funcs, last_val)? {
+            match eval(e, env, registry, funcs, last_val, inference_factor)? {
                 Value::Number(n) => Ok(Value::Number(-n)),
                 Value::Duration(d) => Ok(Value::Duration(-d)),
                 Value::Function(..) => Err("Cannot negate a function".into()),
             }
         }
         Expr::Add(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val)?, eval(rhs, env, registry, funcs, last_val)?) {
+            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
                 (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
                 (Value::Duration(a), Value::Duration(b)) => Ok(Value::Duration(a + b)),
-                _ => Err("Cannot add a number and a time duration".into())
+                (Value::Duration(a), Value::Number(b)) => {
+                    if let Some(f) = inference_factor { Ok(Value::Duration(a + b * f)) } else { Err("Ambiguous unitless number (cannot infer unit)".into()) }
+                },
+                (Value::Number(a), Value::Duration(b)) => {
+                    if let Some(f) = inference_factor { Ok(Value::Duration(a * f + b)) } else { Err("Ambiguous unitless number (cannot infer unit)".into()) }
+                },
+                _ => Err("Cannot add these types".into())
             }
         }
         Expr::Sub(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val)?, eval(rhs, env, registry, funcs, last_val)?) {
+            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
                 (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
                 (Value::Duration(a), Value::Duration(b)) => Ok(Value::Duration(a - b)),
-                _ => Err("Cannot subtract a number and a time duration".into())
+                (Value::Duration(a), Value::Number(b)) => {
+                    if let Some(f) = inference_factor { Ok(Value::Duration(a - b * f)) } else { Err("Ambiguous unitless number (cannot infer unit)".into()) }
+                },
+                (Value::Number(a), Value::Duration(b)) => {
+                    if let Some(f) = inference_factor { Ok(Value::Duration(a * f - b)) } else { Err("Ambiguous unitless number (cannot infer unit)".into()) }
+                },
+                _ => Err("Cannot subtract these types".into())
             }
         }
         Expr::Mul(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val)?, eval(rhs, env, registry, funcs, last_val)?) {
+            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
                 (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
                 (Value::Number(a), Value::Duration(b)) | (Value::Duration(b), Value::Number(a)) => Ok(Value::Duration(a * b)),
                 _ => Err("Cannot multiply two time durations explicitly".into())
             }
         }
         Expr::Div(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val)?, eval(rhs, env, registry, funcs, last_val)?) {
+            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
                 (Value::Number(a), Value::Number(b)) => if b.is_zero() { Err("Division by zero".into()) } else { Ok(Value::Number(a / b)) },
                 (Value::Duration(a), Value::Number(b)) => if b.is_zero() { Err("Division by zero".into()) } else { Ok(Value::Duration(a / b)) },
                 (Value::Duration(a), Value::Duration(b)) => if b.is_zero() { Err("Division by zero".into()) } else { Ok(Value::Number(a / b)) },
@@ -511,13 +485,29 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             }
         }
         Expr::Mod(lhs, rhs) => {
-            match (eval(lhs, env, registry, funcs, last_val)?, eval(rhs, env, registry, funcs, last_val)?) {
+            match (eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?) {
                 (Value::Number(a), Value::Number(b)) => if b.is_zero() { Err("Modulo by zero".into()) } else { Ok(Value::Number(a % b)) },
                 (Value::Duration(a), Value::Duration(b)) => if b.is_zero() { Err("Modulo by zero".into()) } else { Ok(Value::Duration(a % b)) },
-                _ => Err("Cannot modulo a number and a time duration".into())
+                (Value::Duration(a), Value::Number(b)) => {
+                    if let Some(f) = inference_factor {
+                        let scaled_b = b * f;
+                        if scaled_b.is_zero() { Err("Modulo by zero".into()) } else { Ok(Value::Duration(a % scaled_b)) }
+                    } else {
+                        Err("Ambiguous unitless number (cannot infer unit)".into())
+                    }
+                },
+                (Value::Number(a), Value::Duration(b)) => {
+                    if let Some(f) = inference_factor {
+                        let scaled_a = a * f;
+                        if b.is_zero() { Err("Modulo by zero".into()) } else { Ok(Value::Duration(scaled_a % b)) }
+                    } else {
+                        Err("Ambiguous unitless number (cannot infer unit)".into())
+                    }
+                },
+                _ => Err("Cannot modulo these types".into())
             }
         }
-        Expr::Apply(lhs, rhs) => apply_values(eval(lhs, env, registry, funcs, last_val)?, eval(rhs, env, registry, funcs, last_val)?, env, registry, funcs, last_val)
+        Expr::Apply(lhs, rhs) => apply_values(eval(lhs, env, registry, funcs, last_val, inference_factor)?, eval(rhs, env, registry, funcs, last_val, inference_factor)?, env, registry, funcs, last_val, inference_factor)
     }
 }
 
@@ -548,141 +538,104 @@ fn format_exact_decimal(r: &BigRational, places: i32) -> (String, bool) {
     (s, is_approx)
 }
 
-fn format_output(result: &Value, conv_req: &Option<ConversionTarget>, explicit_units: &[FormatUnit], registry: &[UnitDef]) -> String {
+fn format_output(result: &Value, conv_req: &ConversionTarget, explicit_units: &[FormatUnit], registry: &[UnitDef]) -> String {
     match result {
         Value::Number(n) => {
             let is_neg = n < &BigRational::zero();
             let abs_n = if is_neg { -n } else { n.clone() };
-            if let Some(ConversionTarget::Dp(places)) = conv_req {
-                let (val_str, _) = format_exact_decimal(&abs_n, *places);
-                format!("approx. {}{}", if is_neg && abs_n > BigRational::zero() { "-" } else { "" }, val_str)
-            } else {
-                let (val_str, is_approx) = format_exact_decimal(&abs_n, 9);
-                format!("{}{}{}", if is_approx { "approx. " } else { "" }, if is_neg && abs_n > BigRational::zero() { "-" } else { "" }, val_str)
+            let places = conv_req.dp.unwrap_or(9);
+            let (val_str, is_approx) = format_exact_decimal(&abs_n, places);
+            
+            let mut is_approx_final = is_approx;
+            if conv_req.dp.is_some() {
+                let parsed = parse_decimal(&val_str).unwrap_or(BigRational::zero());
+                is_approx_final = abs_n != parsed;
             }
+            
+            let prefix = if is_approx_final { "approx. " } else { "" };
+            format!("{}{}{}", prefix, if is_neg && abs_n > BigRational::zero() { "-" } else { "" }, val_str)
         }
         Value::Duration(d) => format_duration(d.clone(), conv_req, explicit_units, registry),
         Value::Function(f, _) => format!("<function {}>", f.name),
     }
 }
 
-fn format_duration(mut total_seconds: BigRational, conv_req: &Option<ConversionTarget>, explicit_units: &[FormatUnit], registry: &[UnitDef]) -> String {
+fn format_duration(mut total_seconds: BigRational, conv_req: &ConversionTarget, explicit_units: &[FormatUnit], registry: &[UnitDef]) -> String {
     let is_neg = total_seconds < BigRational::zero();
     if is_neg { total_seconds = -total_seconds; }
 
-    if let Some(conv) = conv_req {
-        match conv {
-            ConversionTarget::Units(units) => {
-                if units.len() == 1 {
-                    let (factor, unit_str) = units[0].info();
-                    let val = &total_seconds / factor;
-                    let (val_str, is_approx) = format_exact_decimal(&val, 9);
-                    return format!("{}{}{} {}", if is_approx { "approx. " } else { "" }, if is_neg && total_seconds > BigRational::zero() { "-" } else { "" }, val_str, unit_str);
-                } else {
-                    let mut parts = Vec::new();
-                    let mut remaining = total_seconds.clone();
-                    let mut reconstructed = BigRational::zero(); 
-
-                    for (i, unit) in units.iter().enumerate() {
-                        let (factor, unit_str) = unit.info();
-                        if i == units.len() - 1 {
-                            let val = &remaining / factor;
-                            let val_int = val.to_integer();
-                            let fract = &val - BigRational::from_integer(val_int.clone());
-                            let half = BigRational::new(BigInt::from(1), BigInt::from(2));
-                            let rounded = if fract >= half { val_int + BigInt::from(1) } else { val_int };
-                            reconstructed += BigRational::from_integer(rounded.clone()) * factor;
-                            if !rounded.is_zero() || parts.is_empty() { parts.push(format!("{} {}", rounded, unit_str)); }
-                        } else {
-                            let val = (&remaining / factor).to_integer(); 
-                            if !val.is_zero() {
-                                parts.push(format!("{} {}", val, unit_str));
-                                reconstructed += BigRational::from_integer(val.clone()) * factor;
-                            }
-                            remaining = remaining - BigRational::from_integer(val) * factor;
-                        }
-                    }
-                    return format!("{}{}{}", if total_seconds != reconstructed { "approx. " } else { "" }, if is_neg && total_seconds > BigRational::zero() { "-" } else { "" }, parts.join(" "));
-                }
-            }
-            ConversionTarget::Dp(places) => {
-                if explicit_units.is_empty() {
-                    let (val_str, _) = format_exact_decimal(&total_seconds, *places);
-                    return format!("approx. {}{}", if is_neg && total_seconds > BigRational::zero() { "-" } else { "" }, val_str);
-                }
-                let min_factor = explicit_units.iter().map(|u| u.factor.clone()).min().unwrap();
-                let multiplier = if *places >= 0 { BigRational::from_integer(BigInt::from(10).pow(*places as u32)) } else { BigRational::new(BigInt::one(), BigInt::from(10).pow((-places) as u32)) };
-                let min_step = &min_factor / &multiplier; 
-                let val = &total_seconds / &min_step;
-                let val_int = val.to_integer();
-                let fract = &val - BigRational::from_integer(val_int.clone());
-                let half = BigRational::new(BigInt::from(1), BigInt::from(2));
-                let rounded = if fract >= half { val_int + BigInt::from(1) } else { val_int };
-                let rounded_seconds = BigRational::from_integer(rounded) * &min_step;
-
-                let mut cascade = explicit_units.to_vec();
-                for fallback in ["h", "m", "s"] {
-                    if let Ok(u) = parse_single_unit(fallback, registry) { if !cascade.contains(&u) { cascade.push(u); } }
-                }
-                cascade.sort_by(|a, b| b.factor.cmp(&a.factor));
-                let cascade: Vec<FormatUnit> = cascade.into_iter().filter(|u| u.factor >= min_factor).collect();
-                    
-                let mut parts = Vec::new();
-                let mut remaining = rounded_seconds.clone();
-
-                for (i, unit) in cascade.iter().enumerate() {
-                    let (factor, unit_str) = unit.info();
-                    if i == cascade.len() - 1 {
-                        let val = &remaining / factor;
-                        let (val_str, _) = format_exact_decimal(&val, *places);
-                        if val_str != "0" || parts.is_empty() { parts.push(format!("{} {}", val_str, unit_str)); }
-                    } else {
-                        let val = (&remaining / factor).to_integer(); 
-                        if !val.is_zero() {
-                            parts.push(format!("{} {}", val, unit_str));
-                            remaining = remaining - BigRational::from_integer(val) * factor;
-                        }
-                    }
-                }
-                return format!("approx. {}{}", if is_neg && rounded_seconds > BigRational::zero() { "-" } else { "" }, parts.join(" ")); 
-            }
+    let cascade = if let Some(units) = &conv_req.units {
+        units.clone()
+    } else {
+        let mut c = vec![
+            parse_single_unit("d", registry).unwrap(), 
+            parse_single_unit("h", registry).unwrap(), 
+            parse_single_unit("m", registry).unwrap(), 
+            parse_single_unit("s", registry).unwrap()
+        ];
+        
+        if conv_req.dp.is_some() && !explicit_units.is_empty() {
+            let min_factor = explicit_units.iter().map(|u| &u.factor).min().unwrap().clone();
+            c.retain(|u| u.factor >= min_factor);
         }
-    }
+        c
+    };
 
-    if total_seconds.is_zero() {
-        return format!("0 {}", explicit_units.first().map(|u| u.name.as_str()).unwrap_or("s"));
-    }
-
-    let default_cascade = vec![
-        parse_single_unit("d", registry).unwrap(), // Appended to cascade fallback loop
-        parse_single_unit("h", registry).unwrap(), 
-        parse_single_unit("m", registry).unwrap(), 
-        parse_single_unit("s", registry).unwrap()
-    ];
     let mut parts = Vec::new();
-    let factor_s = BigRational::one();
-    let val = &total_seconds / &factor_s;
-    let val_int = val.to_integer();
-    let fract = &val - BigRational::from_integer(val_int.clone());
-    let half = BigRational::new(BigInt::from(1), BigInt::from(2));
-    let val_rounded = if fract >= half { val_int + BigInt::from(1) } else { val_int };
-    
-    let mut remaining = BigRational::from_integer(val_rounded);
-    let reconstructed = remaining.clone() * &factor_s;
-    
-    for (i, unit) in default_cascade.iter().enumerate() {
+    let mut remaining = total_seconds.clone();
+    let mut reconstructed = BigRational::zero(); 
+
+    for (i, unit) in cascade.iter().enumerate() {
+        let is_last = i == cascade.len() - 1;
         let factor = &unit.factor;
-        if i == default_cascade.len() - 1 {
-            if remaining > BigRational::zero() || parts.is_empty() { parts.push(format!("{} {}", (&remaining / factor).to_integer(), unit.name)); }
+
+        if is_last {
+            let val = &remaining / factor;
+            if let Some(places) = conv_req.dp {
+                let (val_str, _) = format_exact_decimal(&val, places);
+                
+                if val_str != "0" || parts.is_empty() { 
+                    parts.push(format!("{} {}", val_str, unit.name)); 
+                }
+                
+                if let Ok(parsed_rounded) = parse_decimal(&val_str) {
+                    reconstructed += parsed_rounded * factor;
+                }
+            } else {
+                if conv_req.units.is_some() && cascade.len() == 1 {
+                    let (val_str, _) = format_exact_decimal(&val, 9);
+                    parts.push(format!("{} {}", val_str, unit.name));
+                    
+                    if let Ok(parsed) = parse_decimal(&val_str) {
+                        reconstructed += parsed * factor;
+                    }
+                } else {
+                    let val_int = val.to_integer();
+                    let fract = val - BigRational::from_integer(val_int.clone());
+                    let half = BigRational::new(BigInt::from(1), BigInt::from(2));
+                    let rounded = if fract >= half { val_int + BigInt::from(1) } else { val_int };
+                    
+                    if !rounded.is_zero() || parts.is_empty() { 
+                        parts.push(format!("{} {}", rounded, unit.name)); 
+                    }
+                    reconstructed += BigRational::from_integer(rounded) * factor;
+                }
+            }
         } else {
-            let val = (&remaining / factor).to_integer();
+            let val = (&remaining / factor).to_integer(); 
             if !val.is_zero() {
                 parts.push(format!("{} {}", val, unit.name));
-                remaining = remaining - BigRational::from_integer(val) * factor;
+                reconstructed += BigRational::from_integer(val.clone()) * factor;
             }
+            remaining = remaining - BigRational::from_integer(val) * factor;
         }
     }
-    format!("{}{}{}", if total_seconds != reconstructed { "approx. " } else { "" }, if is_neg { "-" } else { "" }, parts.join(" "))
+    
+    let is_approx = total_seconds != reconstructed;
+    let prefix = if is_approx { "approx. " } else { "" };
+    let sign_str = if is_neg && total_seconds > BigRational::zero() { "-" } else { "" };
+    
+    format!("{}{}{}", prefix, sign_str, parts.join(" "))
 }
 
 // --- 6. Evaluator Entry ---
@@ -694,23 +647,22 @@ fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &
     let conv_req = extract_keywords(&mut tokens, registry)?;
     let (mut tokens, mut explicit_units) = form_durations(tokens, registry)?;
     
-    tokens = resolve_unitless(tokens, &explicit_units, &conv_req)?;
     tokens = combine_contiguous_durations(tokens);
     
-    let (mut ast, rest) = parse_expr(&tokens)?;
+    let (ast, rest) = parse_expr(&tokens)?;
     if !rest.is_empty() { return Err("Incomplete expression".to_string()); }
 
     ast.collect_units(&mut explicit_units, registry, funcs);
     
-    let mut inference_unit = None;
-    if let Some(ConversionTarget::Units(units)) = &conv_req {
-        if !units.is_empty() { inference_unit = Some(units[0].name.clone()); }
+    let mut inference_factor = None;
+    if let Some(units) = &conv_req.units {
+        if !units.is_empty() { inference_factor = Some(units[0].factor.clone()); }
     }
-    if inference_unit.is_none() && explicit_units.len() == 1 { inference_unit = Some(explicit_units[0].name.clone()); }
+    if inference_factor.is_none() && explicit_units.len() == 1 { 
+        inference_factor = Some(explicit_units[0].factor.clone()); 
+    }
 
-    if let Some(unit) = inference_unit { ast.infer_numbers(&unit); }
-
-    let result = eval(&ast, &HashMap::new(), registry, funcs, last_val.as_ref())?;
+    let result = eval(&ast, &HashMap::new(), registry, funcs, last_val.as_ref(), inference_factor.as_ref())?;
     Ok((format_output(&result, &conv_req, &explicit_units, registry), result))
 }
 
