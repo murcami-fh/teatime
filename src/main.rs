@@ -16,7 +16,7 @@ use std::io::{self, Write};
 use std::str::FromStr;
 
 const PROJECT_SHORT_NAME: &'static str = "tt";
-const PROJECT_LONG_NAME: &'static str = "Tea Time";
+const PROJECT_LONG_NAME: &'static str = "🍵 Tea Time";
 
 struct RawModeGuard;
 impl Drop for RawModeGuard {
@@ -130,7 +130,7 @@ enum Token {
     Num(BigRational),
     Ident(String),
     Plus, Minus, Multiply, Divide, Modulo, Underscore, LParen, RParen, To, Now,
-    Assign, // Represents :=
+    Assign,
     Duration(BigRational),
 }
 
@@ -654,7 +654,6 @@ fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &
     let mut tokens = tokenize(input)?;
     if tokens.is_empty() { return Ok(("".to_string(), Some(Value::Number(BigRational::zero())))); }
 
-    // Check for top-level assignment definition
     if let Some(pos) = tokens.iter().position(|t| *t == Token::Assign) {
         let lhs = &tokens[..pos];
         let rhs = &tokens[pos+1..];
@@ -682,10 +681,9 @@ fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &
         funcs.retain(|f| f.name != func_name);
         funcs.push(FuncDef { name: func_name, aliases: vec![], args, body });
         
-        return Ok(("".to_string(), None)); // No console output for function definitions
+        return Ok(("".to_string(), None)); 
     }
 
-    // Standard Math Evaluator path 
     let conv_req = extract_keywords(&mut tokens, registry)?;
     let (mut tokens, mut explicit_units) = form_durations(tokens, registry)?;
     
@@ -711,6 +709,16 @@ fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &
 // --- 7. Interactive UI Loop ---
 
 fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        println!("{}", include_str!("../README.md"));
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "-v" || arg == "--version") {
+        println!("{} v{}", PROJECT_LONG_NAME, env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
     let _guard = RawModeGuard;
