@@ -63,7 +63,6 @@ struct FuncDef {
     aliases: Vec<String>,
     args: Vec<String>,
     body: Expr,
-    conv_req: Option<ConversionTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +94,7 @@ enum Expr {
     Div(Box<Expr>, Box<Expr>),
     Mod(Box<Expr>, Box<Expr>),
     Apply(Box<Expr>, Box<Expr>),
+    To(Box<Expr>, ConversionTarget),
 }
 
 #[derive(Clone, Debug)]
@@ -129,7 +129,7 @@ impl Expr {
                     }
                 }
             }
-            Expr::UnaryMinus(e) => e.collect_units(units, registry, funcs),
+            Expr::UnaryMinus(e) | Expr::To(e, _) => e.collect_units(units, registry, funcs),
             Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Div(a, b) | Expr::Mod(a, b) | Expr::Apply(a, b) => {
                 a.collect_units(units, registry, funcs);
                 b.collect_units(units, registry, funcs);
@@ -283,22 +283,22 @@ fn build_registry() -> (Vec<UnitDef>, Vec<FuncDef>) {
             if let Ok(config) = toml::from_str::<Config>(&config_str) {
                 if let Some(units) = config.units {
                     for (name, conf) in units {
-                        if let Ok((_, Some(Value::Duration(seconds)))) = evaluate(&conf.value, None, &registry, &mut funcs) {
-                            registry.push(UnitDef { primary_name: name, factor: seconds, aliases: conf.alias });
+                        if let Ok((_, Some(val))) = evaluate(&conf.value, None, &registry, &mut funcs) {
+                            let (v, _) = val.unwrap();
+                            if let Value::Duration(seconds) = v {
+                                registry.push(UnitDef { primary_name: name, factor: seconds, aliases: conf.alias });
+                            }
                         }
                     }
                 }
                 if let Some(functions) = config.functions {
                     for (_, conf) in functions {
-                        if let Ok(mut tokens) = tokenize(&conf.definition) {
-                            if let Ok(conv_req) = extract_keywords(&mut tokens, &registry) {
-                                let (mut rhs_tokens, _) = form_durations(tokens, &registry).unwrap_or((vec![], vec![]));
-                                rhs_tokens = combine_contiguous_durations(rhs_tokens);
-                                if let Ok((ast, rest)) = parse_expr(&rhs_tokens) {
-                                    if rest.is_empty() {
-                                        let req = if conv_req.is_empty() { None } else { Some(conv_req) };
-                                        funcs.push(FuncDef { name: conf.name, aliases: conf.aliases, args: conf.arguments, body: ast, conv_req: req });
-                                    }
+                        if let Ok(tokens) = tokenize(&conf.definition) {
+                            let (mut rhs_tokens, _) = form_durations(tokens, &registry).unwrap_or((vec![], vec![]));
+                            rhs_tokens = combine_contiguous_durations(rhs_tokens);
+                            if let Ok((ast, rest)) = parse_expr(&rhs_tokens, &registry) {
+                                if rest.is_empty() {
+                                    funcs.push(FuncDef { name: conf.name, aliases: conf.aliases, args: conf.arguments, body: ast });
                                 }
                             }
                         }
@@ -323,40 +323,42 @@ fn parse_single_unit(u: &str, registry: &[UnitDef]) -> Result<FormatUnit, String
     Err(format!("Unknown unit: '{}'", u))
 }
 
-fn extract_keywords(tokens: &mut Vec<Token>, registry: &[UnitDef]) -> Result<ConversionTarget, String> {
+fn parse_conversion_target<'a>(mut tokens: &'a [Token], registry: &[UnitDef]) -> Result<(ConversionTarget, &'a [Token]), String> {
     let mut target = ConversionTarget::default();
-    let mut i = 0;
-    while i < tokens.len() {
-        if tokens[i] == Token::To {
-            tokens.remove(i);
-            let mut args = Vec::new();
-            while i < tokens.len() && !matches!(tokens[i], Token::Plus | Token::Minus | Token::Multiply | Token::Divide | Token::Modulo | Token::LParen | Token::RParen | Token::To | Token::Assign) {
-                args.push(tokens.remove(i));
-            }
-            
-            if args.is_empty() {
-                return Err("Missing target after conversion keyword".to_string());
-            }
+    
+    while !tokens.is_empty() && tokens[0] == Token::Space { tokens = &tokens[1..]; }
+    if tokens.is_empty() { return Err("Missing target after 'to'".into()); }
 
-            if args.len() == 2 {
-                if let (Token::Num(n), Token::Ident(u)) = (&args[0], &args[1]) {
-                    if u.eq_ignore_ascii_case("decimal") || u.eq_ignore_ascii_case("dp") {
-                        target.dp = Some(n.to_integer().to_i32().unwrap_or(0));
-                        continue;
-                    }
-                }
-            }
-            
-            let mut units = Vec::new();
-            for tok in args {
-                if let Token::Ident(u) = tok { units.push(parse_single_unit(&u, registry)?); } else { return Err("Invalid conversion target".into()); }
-            }
-            target.units = Some(units);
+    if tokens.len() >= 2 {
+        let (num_tok, next_tok, rest) = if tokens[1] == Token::Space && tokens.len() >= 3 {
+            (&tokens[0], &tokens[2], &tokens[3..])
         } else {
-            i += 1;
+            (&tokens[0], &tokens[1], &tokens[2..])
+        };
+        
+        if let (Token::Num(n), Token::Ident(u)) = (num_tok, next_tok) {
+            if u.eq_ignore_ascii_case("decimal") || u.eq_ignore_ascii_case("dp") {
+                target.dp = Some(n.to_integer().to_i32().unwrap_or(0));
+                return Ok((target, rest));
+            }
         }
     }
-    Ok(target)
+
+    let mut units = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == Token::Space { i += 1; continue; }
+        if let Token::Ident(ref u) = tokens[i] {
+            if let Ok(fmt_unit) = parse_single_unit(u, registry) {
+                units.push(fmt_unit);
+                i += 1;
+            } else { break; }
+        } else { break; }
+    }
+    
+    if units.is_empty() { return Err("Invalid conversion target".into()); }
+    target.units = Some(units);
+    Ok((target, &tokens[i..]))
 }
 
 fn form_durations(tokens: Vec<Token>, registry: &[UnitDef]) -> Result<(Vec<Token>, Vec<FormatUnit>), String> {
@@ -404,15 +406,54 @@ fn combine_contiguous_durations(tokens: Vec<Token>) -> Vec<Token> {
     new_tokens
 }
 
-fn parse_expr(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
-    let (mut lhs, mut rest) = parse_mul_expr(tokens)?;
+// Precedence 1: String Concatenation 
+fn parse_expr<'a>(tokens: &'a [Token], registry: &[UnitDef]) -> Result<(Expr, &'a [Token]), String> {
+    let (mut lhs, mut rest) = parse_to_expr(tokens, registry)?;
+    while !rest.is_empty() {
+        if rest[0] == Token::Space && rest.len() > 1 && matches!(rest[1], Token::String(_)) {
+            let (rhs, new_rest) = parse_primary(&rest[1..], registry)?;
+            lhs = Expr::Add(Box::new(lhs), Box::new(rhs));
+            rest = new_rest;
+        } else if matches!(rest[0], Token::String(_)) {
+            let (rhs, new_rest) = parse_primary(rest, registry)?;
+            lhs = Expr::Add(Box::new(lhs), Box::new(rhs));
+            rest = new_rest;
+        } else {
+            break;
+        }
+    }
+    Ok((lhs, rest))
+}
+
+// Precedence 2: Conversion (to / as)
+fn parse_to_expr<'a>(tokens: &'a [Token], registry: &[UnitDef]) -> Result<(Expr, &'a [Token]), String> {
+    let (mut lhs, mut rest) = parse_add_expr(tokens, registry)?;
+    while !rest.is_empty() {
+        if rest[0] == Token::To {
+            let (target, new_rest) = parse_conversion_target(&rest[1..], registry)?;
+            lhs = Expr::To(Box::new(lhs), target);
+            rest = new_rest;
+        } else if rest[0] == Token::Space && rest.len() > 1 && rest[1] == Token::To {
+            let (target, new_rest) = parse_conversion_target(&rest[2..], registry)?;
+            lhs = Expr::To(Box::new(lhs), target);
+            rest = new_rest;
+        } else {
+            break;
+        }
+    }
+    Ok((lhs, rest))
+}
+
+// Precedence 3: Addition / Subtraction
+fn parse_add_expr<'a>(tokens: &'a [Token], registry: &[UnitDef]) -> Result<(Expr, &'a [Token]), String> {
+    let (mut lhs, mut rest) = parse_mul_expr(tokens, registry)?;
     while !rest.is_empty() {
         if rest[0] == Token::Plus {
-            let (rhs, new_rest) = parse_mul_expr(&rest[1..])?;
+            let (rhs, new_rest) = parse_mul_expr(&rest[1..], registry)?;
             lhs = Expr::Add(Box::new(lhs), Box::new(rhs));
             rest = new_rest;
         } else if rest[0] == Token::Minus {
-            let (rhs, new_rest) = parse_mul_expr(&rest[1..])?;
+            let (rhs, new_rest) = parse_mul_expr(&rest[1..], registry)?;
             lhs = Expr::Sub(Box::new(lhs), Box::new(rhs));
             rest = new_rest;
         } else { break; }
@@ -420,19 +461,20 @@ fn parse_expr(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     Ok((lhs, rest))
 }
 
-fn parse_mul_expr(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
-    let (mut lhs, mut rest) = parse_space_app(tokens)?;
+// Precedence 4: Multiplication / Division / Modulo
+fn parse_mul_expr<'a>(tokens: &'a [Token], registry: &[UnitDef]) -> Result<(Expr, &'a [Token]), String> {
+    let (mut lhs, mut rest) = parse_space_app(tokens, registry)?;
     while !rest.is_empty() {
         if rest[0] == Token::Multiply {
-            let (rhs, new_rest) = parse_space_app(&rest[1..])?;
+            let (rhs, new_rest) = parse_space_app(&rest[1..], registry)?;
             lhs = Expr::Mul(Box::new(lhs), Box::new(rhs));
             rest = new_rest;
         } else if rest[0] == Token::Divide {
-            let (rhs, new_rest) = parse_space_app(&rest[1..])?;
+            let (rhs, new_rest) = parse_space_app(&rest[1..], registry)?;
             lhs = Expr::Div(Box::new(lhs), Box::new(rhs));
             rest = new_rest;
         } else if rest[0] == Token::Modulo {
-            let (rhs, new_rest) = parse_space_app(&rest[1..])?;
+            let (rhs, new_rest) = parse_space_app(&rest[1..], registry)?;
             lhs = Expr::Mod(Box::new(lhs), Box::new(rhs));
             rest = new_rest;
         } else { break; }
@@ -440,11 +482,13 @@ fn parse_mul_expr(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     Ok((lhs, rest))
 }
 
-fn parse_space_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
-    let (mut lhs, mut rest) = parse_nospace_app(tokens)?;
+// Precedence 5: Semantic Space Application
+fn parse_space_app<'a>(tokens: &'a [Token], registry: &[UnitDef]) -> Result<(Expr, &'a [Token]), String> {
+    let (mut lhs, mut rest) = parse_nospace_app(tokens, registry)?;
     while !rest.is_empty() {
-        if rest[0] == Token::Space {
-            let (rhs, new_rest) = parse_nospace_app(&rest[1..])?;
+        // Only apply if the next parameter is NOT a string. Strings get caught by concat precedence 1.
+        if rest[0] == Token::Space && rest.len() > 1 && !matches!(rest[1], Token::String(_)) {
+            let (rhs, new_rest) = parse_nospace_app(&rest[1..], registry)?;
             lhs = Expr::Apply(Box::new(lhs), Box::new(rhs));
             rest = new_rest;
         } else { break; }
@@ -452,12 +496,13 @@ fn parse_space_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     Ok((lhs, rest))
 }
 
-fn parse_nospace_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
-    let (mut lhs, mut rest) = parse_primary(tokens)?;
+// Precedence 6: Tight Application (Nospace)
+fn parse_nospace_app<'a>(tokens: &'a [Token], registry: &[UnitDef]) -> Result<(Expr, &'a [Token]), String> {
+    let (mut lhs, mut rest) = parse_primary(tokens, registry)?;
     while !rest.is_empty() {
         match rest[0] {
-            Token::Num(_) | Token::Duration(_) | Token::String(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::LParen => {
-                let (rhs, new_rest) = parse_primary(rest)?;
+            Token::Num(_) | Token::Duration(_) | Token::Ident(_) | Token::Now | Token::Underscore | Token::LParen => {
+                let (rhs, new_rest) = parse_primary(rest, registry)?;
                 lhs = Expr::Apply(Box::new(lhs), Box::new(rhs));
                 rest = new_rest;
             }
@@ -467,7 +512,8 @@ fn parse_nospace_app(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
     Ok((lhs, rest))
 }
 
-fn parse_primary(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
+// Precedence 7: Primitives
+fn parse_primary<'a>(tokens: &'a [Token], registry: &[UnitDef]) -> Result<(Expr, &'a [Token]), String> {
     if tokens.is_empty() { return Err("Unexpected end of expression".into()); }
     match &tokens[0] {
         Token::Num(n) => Ok((Expr::Number(n.clone()), &tokens[1..])),
@@ -477,22 +523,30 @@ fn parse_primary(tokens: &[Token]) -> Result<(Expr, &[Token]), String> {
         Token::Now => Ok((Expr::Now, &tokens[1..])),
         Token::Underscore => Ok((Expr::Underscore, &tokens[1..])),
         Token::LParen => {
-            let (expr, rest) = parse_expr(&tokens[1..])?;
+            let (expr, rest) = parse_expr(&tokens[1..], registry)?;
             if rest.is_empty() || rest[0] != Token::RParen { return Err("Missing closing parenthesis".into()); }
             Ok((expr, &rest[1..]))
         }
         Token::Minus => {
-            let (expr, rest) = parse_primary(&tokens[1..])?;
+            let (expr, rest) = parse_primary(&tokens[1..], registry)?;
             Ok((Expr::UnaryMinus(Box::new(expr)), rest))
         }
-        Token::Plus => parse_primary(&tokens[1..]),
+        Token::Plus => parse_primary(&tokens[1..], registry),
         _ => Err(format!("Unexpected syntax token: {:?}", tokens[0])),
     }
 }
 
 // --- 4. Evaluator (Resolves functions, args & math) ---
 
-fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>, explicit_units: &[FormatUnit]) -> Result<Value, String> {
+fn apply_values(
+    l: Value, r: Value, 
+    env: &HashMap<String, Value>, 
+    registry: &[UnitDef], 
+    funcs: &[FuncDef], 
+    last_val: Option<&Value>, 
+    inference_factor: Option<&BigRational>,
+    explicit_units: &[FormatUnit]
+) -> Result<Value, String> {
     let (l_val, l_req) = l.clone().unwrap();
     let (r_val, r_req) = r.clone().unwrap();
     let req = l_req.or(r_req);
@@ -518,9 +572,7 @@ fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[Un
                 for (name, val) in f.args.iter().zip(args.into_iter()) {
                     new_env.insert(name.clone(), val);
                 }
-                let mut val = eval(&f.body, &new_env, registry, funcs, last_val, inference_factor, explicit_units)?;
-                if let Some(f_req) = &f.conv_req { val = Value::Formatted(Box::new(val), f_req.clone()); }
-                val
+                eval(&f.body, &new_env, registry, funcs, last_val, inference_factor, explicit_units)?
             } else {
                 Value::Function(f, args)
             }
@@ -532,7 +584,15 @@ fn apply_values(l: Value, r: Value, env: &HashMap<String, Value>, registry: &[Un
     Ok(res)
 }
 
-fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: &[FuncDef], last_val: Option<&Value>, inference_factor: Option<&BigRational>, explicit_units: &[FormatUnit]) -> Result<Value, String> {
+fn eval(
+    expr: &Expr, 
+    env: &HashMap<String, Value>, 
+    registry: &[UnitDef], 
+    funcs: &[FuncDef], 
+    last_val: Option<&Value>, 
+    inference_factor: Option<&BigRational>,
+    explicit_units: &[FormatUnit]
+) -> Result<Value, String> {
     match expr {
         Expr::Number(n) => Ok(Value::Number(n.clone())),
         Expr::Duration(d) => Ok(Value::Duration(d.clone())),
@@ -548,9 +608,7 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             for def in funcs {
                 if def.name.to_lowercase() == name_lower || def.aliases.iter().any(|a| a.to_lowercase() == name_lower) {
                     if def.args.is_empty() { 
-                        let mut val = eval(&def.body, env, registry, funcs, last_val, inference_factor, explicit_units)?; 
-                        if let Some(req) = &def.conv_req { val = Value::Formatted(Box::new(val), req.clone()); }
-                        return Ok(val);
+                        return eval(&def.body, env, registry, funcs, last_val, inference_factor, explicit_units);
                     }
                     return Ok(Value::Function(def.clone(), vec![]));
                 }
@@ -570,6 +628,17 @@ fn eval(expr: &Expr, env: &HashMap<String, Value>, registry: &[UnitDef], funcs: 
             };
             if let Some(r) = req { res = Value::Formatted(Box::new(res), r); }
             Ok(res)
+        }
+        Expr::To(e, target) => {
+            let mut val = eval(e, env, registry, funcs, last_val, inference_factor, explicit_units)?;
+            let mut final_target = target.clone();
+            
+            if let Value::Formatted(inner, req) = val {
+                val = *inner;
+                if final_target.dp.is_none() { final_target.dp = req.dp; }
+                if final_target.units.is_none() { final_target.units = req.units; }
+            }
+            Ok(Value::Formatted(Box::new(val), final_target))
         }
         Expr::Add(lhs, rhs) => {
             let l_full = eval(lhs, env, registry, funcs, last_val, inference_factor, explicit_units)?;
@@ -837,7 +906,7 @@ fn format_duration(mut total_seconds: BigRational, conv_req: &ConversionTarget, 
 // --- 6. Evaluator Entry ---
 
 fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &mut Vec<FuncDef>) -> Result<(String, Option<Value>), String> {
-    let mut tokens = tokenize(input)?;
+    let tokens = tokenize(input)?;
     if tokens.is_empty() { return Ok(("".to_string(), Some(Value::Number(BigRational::zero())))); }
 
     if let Some(pos) = tokens.iter().position(|t| *t == Token::Assign) {
@@ -859,42 +928,39 @@ fn evaluate(input: &str, last_val: Option<Value>, registry: &[UnitDef], funcs: &
             }
         }
         
-        let mut rhs_vec = rhs.to_vec();
-        let conv_req = extract_keywords(&mut rhs_vec, registry)?;
-        
-        let (mut rhs_tokens, _) = form_durations(rhs_vec, registry)?;
+        let rhs_tokens = rhs.to_vec();
+        let (mut rhs_tokens, _) = form_durations(rhs_tokens, registry)?;
         rhs_tokens = combine_contiguous_durations(rhs_tokens);
         
-        let (body, rest) = parse_expr(&rhs_tokens)?;
+        let (body, rest) = parse_expr(&rhs_tokens, registry)?;
         if !rest.is_empty() { return Err("Incomplete expression in function body".to_string()); }
         
-        let req = if conv_req.is_empty() { None } else { Some(conv_req) };
         funcs.retain(|f| f.name != func_name);
-        funcs.push(FuncDef { name: func_name, aliases: vec![], args, body, conv_req: req });
+        funcs.push(FuncDef { name: func_name, aliases: vec![], args, body });
         
         return Ok(("".to_string(), None)); 
     }
 
-    let conv_req = extract_keywords(&mut tokens, registry)?;
     let (mut tokens, mut explicit_units) = form_durations(tokens, registry)?;
-    
     tokens = combine_contiguous_durations(tokens);
     
-    let (ast, rest) = parse_expr(&tokens)?;
+    let (ast, rest) = parse_expr(&tokens, registry)?;
     if !rest.is_empty() { return Err("Incomplete expression".to_string()); }
 
     ast.collect_units(&mut explicit_units, registry, funcs);
     
     let mut inference_factor = None;
-    if let Some(units) = &conv_req.units {
-        if !units.is_empty() { inference_factor = Some(units[0].factor.clone()); }
-    }
-    if inference_factor.is_none() && explicit_units.len() == 1 { 
+    if explicit_units.len() == 1 { 
         inference_factor = Some(explicit_units[0].factor.clone()); 
     }
 
     let result = eval(&ast, &HashMap::new(), registry, funcs, last_val.as_ref(), inference_factor.as_ref(), &explicit_units)?;
-    Ok((format_value(&result, &conv_req, &explicit_units, registry), Some(result)))
+    
+    let (val_unwrapped, req) = result.clone().unwrap();
+    let empty_req = ConversionTarget::default();
+    let final_req = req.unwrap_or(empty_req);
+    
+    Ok((format_value(&val_unwrapped, &final_req, &explicit_units, registry), Some(result)))
 }
 
 // --- 7. Interactive UI Loop ---
