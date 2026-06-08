@@ -18,6 +18,9 @@ use std::str::FromStr;
 const PROJECT_SHORT_NAME: &'static str = "tt";
 const PROJECT_LONG_NAME: &'static str = "🍵 Tea Time";
 
+#[cfg(test)]
+mod tests;
+
 struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
